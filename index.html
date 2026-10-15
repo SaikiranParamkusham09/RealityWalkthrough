@@ -1,0 +1,125 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Flat 01 walkthrough (PlayCanvas prototype)</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#222;font-family:system-ui,sans-serif}
+canvas{width:100%;height:100%;display:block;touch-action:none}
+#hud{position:fixed;top:10px;left:10px;background:rgba(0,0,0,.65);color:#fff;padding:10px 12px;border-radius:8px;max-width:320px;font-size:13px;line-height:1.35}
+#hud b{font-size:15px}
+#compass{position:fixed;top:10px;right:10px;width:110px;height:110px}
+#rooms{position:fixed;bottom:10px;left:10px;right:10px;display:flex;flex-wrap:wrap;gap:6px}
+#rooms button,#vr{background:rgba(20,20,20,.75);color:#fff;border:1px solid #888;border-radius:6px;padding:6px 9px;font-size:12px}
+#vr{position:fixed;bottom:60px;right:10px;font-size:14px}
+#joy{position:fixed;bottom:70px;left:20px;width:110px;height:110px;border-radius:50%;background:rgba(255,255,255,.15);border:2px solid rgba(255,255,255,.4);display:none}
+#knob{position:absolute;left:35px;top:35px;width:40px;height:40px;border-radius:50%;background:rgba(255,255,255,.6)}
+#stats{position:fixed;bottom:60px;left:10px;color:#ccc;font:11px monospace;background:rgba(0,0,0,.5);padding:2px 5px}
+</style></head><body>
+<canvas id="c"></canvas>
+<div id="hud"><b id="room">Loading…</b><br><span id="zone"></span><br><span id="note" style="color:#ffd27f"></span><br><span style="color:#aaa">Desktop: click to look, WASD to walk. Phone: left joystick to walk, drag to look. Click a yellow marker or a room button to jump.</span></div>
+<svg id="compass" viewBox="-55 -55 110 110"><circle r="52" fill="rgba(0,0,0,.6)" stroke="#fff"/><g id="needle"><polygon points="0,-44 8,0 -8,0" fill="#e33"/><polygon points="0,44 8,0 -8,0" fill="#ddd"/><text y="-30" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold" transform="translate(0,-8)">N</text></g></svg>
+<div id="joy"><div id="knob"></div></div>
+<div id="stats"></div>
+<button id="vr">Enter VR</button>
+<div id="rooms"></div>
+<script type="module">
+import * as pc from './lib/playcanvas.min.mjs';
+const data = await (await fetch('assets/scene-data.json')).json();
+const canvas = document.getElementById('c');
+const app = new pc.Application(canvas, {mouse:new pc.Mouse(canvas), keyboard:new pc.Keyboard(window), touch:new pc.TouchDevice(canvas), graphicsDeviceOptions:{xrCompatible:true, antialias:true}});
+app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW); app.setCanvasResolution(pc.RESOLUTION_AUTO);
+window.addEventListener('resize',()=>app.resizeCanvas());
+pc.WasmModule.setConfig('DracoDecoderModule',{glueUrl:'lib/draco_wasm_wrapper_gltf.js',wasmUrl:'lib/draco_decoder_gltf.wasm'});
+app.scene.ambientLight = new pc.Color(0,0,0);
+app.start();
+const EYE = 1.6, RADIUS = 0.22, SPEED = 1.4;  // metres, metres/second
+// --- camera rig: 1 unit = 1 metre, same as Blender ---
+const rig = new pc.Entity('rig'); app.root.addChild(rig);
+const cam = new pc.Entity('cam'); cam.addComponent('camera',{clearColor:new pc.Color(.85,.88,.92),nearClip:.05,farClip:60,fov:70});
+cam.setLocalPosition(0,EYE,0); rig.addChild(cam);
+let yaw=0,pitch=0;
+// --- load the baked model ---
+const url = new URLSearchParams(location.search).get('model') || 'assets/flat01.glb';
+const splatUrl = new URLSearchParams(location.search).get('splat');
+if(splatUrl){ const a=new pc.Asset('splat','gsplat',{url:splatUrl}); app.assets.add(a); a.ready(()=>{ const e=new pc.Entity('splat'); e.addComponent('gsplat',{asset:a}); app.root.addChild(e); window.__loaded=true; }); a.on('error',m=>document.getElementById('room').textContent='Splat load error '+m); app.assets.load(a); }
+else app.assets.loadFromUrl(url,'container',(err,asset)=>{
+  if(err){document.getElementById('room').textContent='Load error '+err;return;}
+  const e = asset.resource.instantiateRenderEntity(); app.root.addChild(e);
+  // lighting is baked into the texture: show it as-is (unlit)
+  e.findComponents('render').forEach(r=>r.meshInstances.forEach(mi=>{
+    const m=mi.material; m.useLighting=false; m.useSkybox=false; m.emissiveMap=m.diffuseMap; m.emissive=new pc.Color(1,1,1); m.diffuse=new pc.Color(0,0,0); m.diffuseMap=null; m.update();
+  }));
+  window.__loaded=true;
+});
+// --- hotspots (room-to-room teleport markers) ---
+const markerMat=new pc.StandardMaterial(); markerMat.emissive=new pc.Color(1,.8,.1); markerMat.useLighting=false; markerMat.update();
+const spots=[];
+data.cams.filter(c=>!/hero|Pooja/.test(c.name)).forEach(c=>{
+  const m=new pc.Entity(); m.addComponent('render',{type:'cylinder',material:markerMat}); m.setLocalScale(.45,.02,.45);
+  m.setPosition(c.pos[0],.02,c.pos[2]); app.root.addChild(m); spots.push({c,m});
+  const b=document.createElement('button'); b.textContent=c.name; b.onclick=()=>go(c); document.getElementById('rooms').appendChild(b);
+});
+function go(c){ rig.setPosition(c.pos[0],0,c.pos[2]); yaw=c.yaw; pitch=0; }
+go(data.cams.find(c=>c.name.startsWith('Drawing'))||data.cams[0]);
+// --- collision: wall boxes from Blender (2D, plan view) ---
+const W=data.walls;
+function blocked(x,z){ for(const w of W){ if(x>w[0]-RADIUS&&x<w[1]+RADIUS&&z>w[2]-RADIUS&&z<w[3]+RADIUS) return true;} return false; }
+function moveBy(dx,dz){ const p=rig.getPosition(); let x=p.x,z=p.z;
+  if(!blocked(x+dx,z)) x+=dx; if(!blocked(x,z+dz)) z+=dz; rig.setPosition(x,0,z); }
+// --- input ---
+let mouseDown=false;
+canvas.addEventListener('mousedown',ev=>{ if(!pickSpot(ev.clientX,ev.clientY) && !pc.Mouse.isPointerLocked()) app.mouse.enablePointerLock(); });
+app.mouse.on(pc.EVENT_MOUSEMOVE,e=>{ if(pc.Mouse.isPointerLocked()){ yaw-=e.dx*.15; pitch=Math.max(-85,Math.min(85,pitch-e.dy*.15)); }});
+function pickSpot(sx,sy){ const r=canvas.getBoundingClientRect(); let best=null,bd=40;
+  for(const s of spots){ const w=s.m.getPosition(); const v=cam.camera.worldToScreen(w); const fwd=cam.forward, d=w.clone().sub(cam.getPosition());
+    if(d.dot(fwd)<=0) continue; const dist=Math.hypot(v.x-(sx-r.left),v.y-(sy-r.top)); if(dist<bd){bd=dist;best=s;} }
+  if(best){ go(best.c); return true;} return false; }
+// touch: left joystick = walk, drag elsewhere = look, tap marker = teleport
+const joy=document.getElementById('joy'),knob=document.getElementById('knob'); let jv={x:0,y:0},joyId=null,lookId=null,last={},tapStart={};
+if('ontouchstart' in window) joy.style.display='block';
+joy.addEventListener('touchstart',e=>{joyId=e.changedTouches[0].identifier;e.preventDefault();});
+window.addEventListener('touchmove',e=>{ for(const t of e.changedTouches){
+  if(t.identifier===joyId){ const r=joy.getBoundingClientRect(); let x=(t.clientX-r.left-55)/45,y=(t.clientY-r.top-55)/45; const l=Math.hypot(x,y); if(l>1){x/=l;y/=l;} jv={x,y}; knob.style.left=(35+x*45)+'px'; knob.style.top=(35+y*45)+'px'; }
+  else if(t.identifier===lookId){ yaw+=(t.clientX-last.x)*.25; pitch=Math.max(-85,Math.min(85,pitch+(t.clientY-last.y)*.25)); last={x:t.clientX,y:t.clientY}; } }},{passive:false});
+canvas.addEventListener('touchstart',e=>{const t=e.changedTouches[0]; lookId=t.identifier; last={x:t.clientX,y:t.clientY}; tapStart={x:t.clientX,y:t.clientY,t:performance.now()};});
+window.addEventListener('touchend',e=>{ for(const t of e.changedTouches){ if(t.identifier===joyId){joyId=null;jv={x:0,y:0};knob.style.left=knob.style.top='35px';}
+  if(t.identifier===lookId){ lookId=null; if(performance.now()-tapStart.t<300&&Math.hypot(t.clientX-tapStart.x,t.clientY-tapStart.y)<10) pickSpot(t.clientX,t.clientY);} }});
+// --- vastu ---
+// North in PlayCanvas coords (x,z). Blender north vector is in the .blend metadata; here north = -X.
+const N={x:data.north_pc_xz[0],z:data.north_pc_xz[1]}; const E={x:-N.z,z:N.x}; // east = north rotated 90° clockwise seen from above (y-up, z toward viewer)
+const NOTES={NE:'North-east (Ishanya): best kept light and open; ideal for pooja/meditation. A bedroom here is acceptable for children or guests.',
+ E:'East: good for living rooms and windows for morning sun.', SE:'South-east (Agneya, fire): ideal zone for the kitchen. Cook facing east.',
+ S:'South: suitable for bedrooms, storage and dressing; keep heavy furniture here.', SW:'South-west (Nairutya): best for the master bedroom; head towards south when sleeping.',
+ W:'West: suitable for drawing/dining and children\'s study.', NW:'North-west (Vayavya, air): good for guest bedroom, storage or utility.',
+ N:'North (Kubera): keep open, good for living and entrance.', Centre:'Centre (Brahmasthan): keep open and uncluttered; dining is acceptable.'};
+// flat extent for the 3x3 grid fallback
+let minX=1e9,maxX=-1e9,minZ=1e9,maxZ=-1e9; W.forEach(w=>{minX=Math.min(minX,w[0]);maxX=Math.max(maxX,w[1]);minZ=Math.min(minZ,w[2]);maxZ=Math.max(maxZ,w[3]);});
+function zoneAt(x,z){ // fallback: 3x3 grid in compass axes
+  const cx=(minX+maxX)/2,cz=(minZ+maxZ)/2,dx=x-cx,dz=z-cz; const n=(dx*N.x+dz*N.z),e=(dx*E.x+dz*E.z);
+  const hn=Math.abs((maxX-minX)*N.x+(maxZ-minZ)*N.z)/6, he=Math.abs((maxX-minX)*E.x+(maxZ-minZ)*E.z)/6;
+  const ns=n>hn?'N':n<-hn?'S':'', ew=e>he?'E':e<-he?'W':''; return (ns+ew)||'Centre'; }
+function roomAt(x,z){ const by=-z; return data.rooms.filter(r=>x>=r.x0&&x<=r.x1&&by>=r.y0&&by<=r.y1).sort((a,b)=>(a.x1-a.x0)*(a.y1-a.y0)-(b.x1-b.x0)*(b.y1-b.y0))[0]; }
+let fpsAcc=0,fpsN=0,fpsT=0; window.__fps=[];
+app.on('update',dt=>{
+  const k=app.keyboard; let f=0,s=0;
+  if(k.isPressed(pc.KEY_W)||k.isPressed(pc.KEY_UP))f+=1; if(k.isPressed(pc.KEY_S)||k.isPressed(pc.KEY_DOWN))f-=1;
+  if(k.isPressed(pc.KEY_D)||k.isPressed(pc.KEY_RIGHT))s+=1; if(k.isPressed(pc.KEY_A)||k.isPressed(pc.KEY_LEFT))s-=1;
+  f-=jv.y; s+=jv.x;
+  const yr=yaw*Math.PI/180, fx=-Math.sin(yr), fz=-Math.cos(yr);
+  if(f||s) moveBy((fx*f+(-fz)*s)*SPEED*dt,(fz*f+fx*s)*SPEED*dt);
+  if(!app.xr.active){ rig.setEulerAngles(0,yaw,0); cam.setLocalEulerAngles(pitch,0,0); }
+  const p=rig.getPosition(), r=roomAt(p.x,p.z), z=r?r.zone:zoneAt(p.x,p.z);
+  document.getElementById('room').textContent=(r?r.name.replace(/ \(.*\)/,''):'Passage')+' — vastu zone '+z;
+  document.getElementById('zone').textContent=r?('Plan size '+r.label+' mm'):'';
+  document.getElementById('note').textContent=NOTES[z]||'';
+  // compass: angle of north relative to view direction
+  const v=cam.forward, ang=Math.atan2(v.x*N.z-v.z*N.x, v.x*N.x+v.z*N.z)*180/Math.PI;
+  document.getElementById('needle').setAttribute('transform','rotate('+ang+')');
+  spots.forEach(s=>s.m.setLocalEulerAngles(0,performance.now()/20,0));
+  fpsAcc+=dt;fpsN++; if(fpsAcc>1){ const fps=fpsN/fpsAcc; window.__fps.push(fps); document.getElementById('stats').textContent=fps.toFixed(1)+' fps · draw calls '+(app.stats.drawCalls.total)+' · tris '+app.stats.frame.triangles; fpsAcc=0;fpsN=0; }
+});
+// --- WebXR VR button ---
+const vrBtn=document.getElementById('vr');
+if(!app.xr.supported||!app.xr.isAvailable(pc.XRTYPE_VR)){ vrBtn.textContent='VR not available here'; }
+app.xr.on('available:'+pc.XRTYPE_VR,a=>vrBtn.textContent=a?'Enter VR':'VR not available here');
+vrBtn.onclick=()=>{ if(app.xr.active) app.xr.end(); else if(app.xr.isAvailable(pc.XRTYPE_VR)) cam.camera.startXr(pc.XRTYPE_VR,pc.XRSPACE_LOCALFLOOR); };
+window.__app=app;
+</script></body></html>
