@@ -33,19 +33,34 @@ app.start();
 const EYE = 1.6, RADIUS = 0.22, SPEED = 1.4;  // metres, metres/second
 // --- camera rig: 1 unit = 1 metre, same as Blender ---
 const rig = new pc.Entity('rig'); app.root.addChild(rig);
-const cam = new pc.Entity('cam'); cam.addComponent('camera',{clearColor:new pc.Color(.85,.88,.92),nearClip:.05,farClip:60,fov:70});
+const cam = new pc.Entity('cam'); cam.addComponent('camera',{toneMapping:pc.TONEMAP_NEUTRAL,gammaCorrection:pc.GAMMA_SRGB,clearColor:new pc.Color(.85,.88,.92),nearClip:.05,farClip:60,fov:70});
 cam.setLocalPosition(0,EYE,0); rig.addChild(cam);
 let yaw=0,pitch=0;
 // --- load the baked model ---
 const url = new URLSearchParams(location.search).get('model') || 'assets/flat01.glb';
+const EXP=parseFloat(new URLSearchParams(location.search).get('exp')||'1');  // viewer exposure multiplier for the baked look
+const LMSCALE=parseFloat(new URLSearchParams(location.search).get('lm')||'1.44');  // from <flat>_lightmap.json (scale x 2^exposure_ev)
+const AMB=parseFloat(new URLSearchParams(location.search).get('amb')||'0.7');
 const splatUrl = new URLSearchParams(location.search).get('splat');
 if(splatUrl){ const a=new pc.Asset('splat','gsplat',{url:splatUrl}); app.assets.add(a); a.ready(()=>{ const e=new pc.Entity('splat'); e.addComponent('gsplat',{asset:a}); app.root.addChild(e); window.__loaded=true; }); a.on('error',m=>document.getElementById('room').textContent='Splat load error '+m); app.assets.load(a); }
 else app.assets.loadFromUrl(url,'container',(err,asset)=>{
   if(err){document.getElementById('room').textContent='Load error '+err;return;}
   const e = asset.resource.instantiateRenderEntity(); app.root.addChild(e);
-  // lighting is baked into the texture: show it as-is (unlit)
+  // Light-only lightmap (TEXCOORD_1, shipped as the glTF emissive texture) x full-res base colour (TEXCOORD_0).
+  // StandardMaterial.lightMap feeds the diffuse light term, so final = baseColour * lightmap * LMSCALE * EXP, then tone-mapped.
+  // Objects without a lightmap (small items, high-poly CC0 models) get a flat ambient term AMB instead.
   e.findComponents('render').forEach(r=>r.meshInstances.forEach(mi=>{
-    const m=mi.material; m.useLighting=false; m.useSkybox=false; m.emissiveMap=m.diffuseMap; m.emissive=new pc.Color(1,1,1); m.diffuse=new pc.Color(0,0,0); m.diffuseMap=null; m.update();
+    const m=mi.material; m.useSkybox=false; m.metalness=0; m.useMetalness=true; m.specularityFactor=0; m.gloss=0;
+    if(m.emissiveMap){
+      const s=LMSCALE*EXP; m.useLighting=true;
+      m.lightMap=m.emissiveMap; m.lightMapUv=m.emissiveMapUv; m.lightMapTiling=m.emissiveMapTiling; m.lightMapOffset=m.emissiveMapOffset;
+      m.emissiveMap=null; m.emissive=new pc.Color(0,0,0);
+      m.diffuse=new pc.Color(m.diffuse.r*s,m.diffuse.g*s,m.diffuse.b*s);
+    } else {
+      const g=AMB*EXP; m.useLighting=false; m.emissive=new pc.Color(m.diffuse.r*g,m.diffuse.g*g,m.diffuse.b*g); m.emissiveMap=m.diffuseMap;
+      m.emissiveMapUv=m.diffuseMapUv; m.emissiveMapTiling=m.diffuseMapTiling; m.emissiveMapOffset=m.diffuseMapOffset; m.diffuse=new pc.Color(0,0,0); m.diffuseMap=null;
+    }
+    m.update();
   }));
   window.__loaded=true;
 });
@@ -122,4 +137,5 @@ if(!app.xr.supported||!app.xr.isAvailable(pc.XRTYPE_VR)){ vrBtn.textContent='VR 
 app.xr.on('available:'+pc.XRTYPE_VR,a=>vrBtn.textContent=a?'Enter VR':'VR not available here');
 vrBtn.onclick=()=>{ if(app.xr.active) app.xr.end(); else if(app.xr.isAvailable(pc.XRTYPE_VR)) cam.camera.startXr(pc.XRTYPE_VR,pc.XRSPACE_LOCALFLOOR); };
 window.__app=app;
+window.__view=(n,dy,p)=>{const c=data.cams.find(c=>c.name===n); go(c); yaw+=dy||0; pitch=p||0;};
 </script></body></html>
