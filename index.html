@@ -14,7 +14,7 @@ canvas{width:100%;height:100%;display:block;touch-action:none}
 #stats{position:fixed;bottom:60px;left:10px;color:#ccc;font:11px monospace;background:rgba(0,0,0,.5);padding:2px 5px}
 </style></head><body>
 <canvas id="c"></canvas>
-<div id="hud"><b id="room">Loading…</b><br><span id="zone"></span><br><span id="note" style="color:#ffd27f"></span><br><span style="color:#aaa">Desktop: click to look, WASD to walk. Phone: left joystick to walk, drag to look. Click a yellow marker or a room button to jump.</span></div>
+<div id="hud"><b id="room">Loading…</b><br><span id="zone"></span><br><span id="note" style="color:#ffd27f"></span><br><span style="color:#aaa">Desktop: click to look, WASD to walk. Phone: left joystick to walk, drag to look. Click a floor ring or a room button to jump.</span></div>
 <svg id="compass" viewBox="-55 -55 110 110"><circle r="52" fill="rgba(0,0,0,.6)" stroke="#fff"/><g id="needle"><polygon points="0,-44 8,0 -8,0" fill="#e33"/><polygon points="0,44 8,0 -8,0" fill="#ddd"/><text y="-30" text-anchor="middle" fill="#fff" font-size="12" font-weight="bold" transform="translate(0,-8)">N</text></g></svg>
 <div id="joy"><div id="knob"></div></div>
 <div id="stats"></div>
@@ -25,6 +25,7 @@ import * as pc from './lib/playcanvas.min.mjs';
 const data = await (await fetch('assets/scene-data.json')).json();
 const canvas = document.getElementById('c');
 const app = new pc.Application(canvas, {mouse:new pc.Mouse(canvas), keyboard:new pc.Keyboard(window), touch:new pc.TouchDevice(canvas), graphicsDeviceOptions:{xrCompatible:true, antialias:true}});
+window.__app=app;
 app.setCanvasFillMode(pc.FILLMODE_FILL_WINDOW); app.setCanvasResolution(pc.RESOLUTION_AUTO);
 window.addEventListener('resize',()=>app.resizeCanvas());
 pc.WasmModule.setConfig('DracoDecoderModule',{glueUrl:'lib/draco_wasm_wrapper_gltf.js',wasmUrl:'lib/draco_decoder_gltf.wasm'});
@@ -38,9 +39,12 @@ cam.setLocalPosition(0,EYE,0); rig.addChild(cam);
 let yaw=0,pitch=0;
 // --- load the baked model ---
 const url = new URLSearchParams(location.search).get('model') || 'assets/flat01.glb';
-const EXP=parseFloat(new URLSearchParams(location.search).get('exp')||'1');  // viewer exposure multiplier for the baked look
-const LMSCALE=parseFloat(new URLSearchParams(location.search).get('lm')||'1.44');  // from <flat>_lightmap.json (scale x 2^exposure_ev)
-const AMB=parseFloat(new URLSearchParams(location.search).get('amb')||'0.7');
+// v7: matches the approved Cycles stills (AgX Base Contrast, -0.6 EV). PlayCanvas 2.23 has no AgX operator, so we use its
+// Neutral (Khronos PBR Neutral) tonemap, the closest built-in, with the same -0.6 EV exposure.
+const EXP=parseFloat(new URLSearchParams(location.search).get('exp')||String(Math.pow(2,-0.6)));
+const LMSCALE=parseFloat(new URLSearchParams(location.search).get('lm')||'2.86');  // v7: tuned so the viewer's mean brightness matches the approved Cycles stills (bake scale 1/K = 7.12 is for Blender's sRGB-decoded preview)
+const WB=(new URLSearchParams(location.search).get('wb')||'0.95,1,1.08').split(',').map(Number);  // v7: neutral-tonemap white balance vs AgX
+const AMB=parseFloat(new URLSearchParams(location.search).get('amb')||'1.0');  // v7: flat ambient for unbaked small items (x EXP)
 const splatUrl = new URLSearchParams(location.search).get('splat');
 if(splatUrl){ const a=new pc.Asset('splat','gsplat',{url:splatUrl}); app.assets.add(a); a.ready(()=>{ const e=new pc.Entity('splat'); e.addComponent('gsplat',{asset:a}); app.root.addChild(e); window.__loaded=true; }); a.on('error',m=>document.getElementById('room').textContent='Splat load error '+m); app.assets.load(a); }
 else app.assets.loadFromUrl(url,'container',(err,asset)=>{
@@ -51,11 +55,19 @@ else app.assets.loadFromUrl(url,'container',(err,asset)=>{
   // Objects without a lightmap (small items, high-poly CC0 models) get a flat ambient term AMB instead.
   e.findComponents('render').forEach(r=>r.meshInstances.forEach(mi=>{
     const m=mi.material; m.useSkybox=false; m.metalness=0; m.useMetalness=true; m.specularityFactor=0; m.gloss=0;
+    const nm=(m.name||'').toLowerCase();
+    if(nm.includes('mirror')){   // v7 mirror material: bright neutral silver with a soft sheen (no env map in the viewer)
+      m.useLighting=false; m.diffuseMap=null; m.emissiveMap=null; m.diffuse=new pc.Color(0,0,0);
+      m.emissive=new pc.Color(.80,.83,.86).mulScalar(EXP*1.1); m.update(); return;
+    }
+    if(!m.emissiveMap && (m.emissive.r+m.emissive.g+m.emissive.b)>0.05){   // v7 glow (LED strips, opal globes): stay self-lit
+      m.useLighting=false; m.emissive=m.emissive.clone().mulScalar(3.0*EXP); m.diffuse=new pc.Color(0,0,0); m.update(); return;
+    }
     if(m.emissiveMap){
       const s=LMSCALE*EXP; m.useLighting=true;
       m.lightMap=m.emissiveMap; m.lightMapUv=m.emissiveMapUv; m.lightMapTiling=m.emissiveMapTiling; m.lightMapOffset=m.emissiveMapOffset;
       m.emissiveMap=null; m.emissive=new pc.Color(0,0,0);
-      m.diffuse=new pc.Color(m.diffuse.r*s,m.diffuse.g*s,m.diffuse.b*s);
+      m.diffuse=new pc.Color(m.diffuse.r*s*WB[0],m.diffuse.g*s*WB[1],m.diffuse.b*s*WB[2]);
     } else {
       const g=AMB*EXP; m.useLighting=false; m.emissive=new pc.Color(m.diffuse.r*g,m.diffuse.g*g,m.diffuse.b*g); m.emissiveMap=m.diffuseMap;
       m.emissiveMapUv=m.diffuseMapUv; m.emissiveMapTiling=m.diffuseMapTiling; m.emissiveMapOffset=m.diffuseMapOffset; m.diffuse=new pc.Color(0,0,0); m.diffuseMap=null;
@@ -65,11 +77,16 @@ else app.assets.loadFromUrl(url,'container',(err,asset)=>{
   window.__loaded=true;
 });
 // --- hotspots (room-to-room teleport markers) ---
-const markerMat=new pc.StandardMaterial(); markerMat.emissive=new pc.Color(1,.8,.1); markerMat.useLighting=false; markerMat.update();
+// v3: small translucent ring (was a bright yellow disc); brightens on hover
+function ringMat(op){ const m=new pc.StandardMaterial(); m.useLighting=false; m.emissive=new pc.Color(1,1,1); m.diffuse=new pc.Color(0,0,0);
+  m.opacity=op; m.blendType=pc.BLEND_NORMAL; m.depthWrite=false; m.update(); return m; }
+const RING_IDLE=.28, RING_HOVER=.85;
 const spots=[];
 data.cams.filter(c=>!/hero|Pooja/.test(c.name)).forEach(c=>{
-  const m=new pc.Entity(); m.addComponent('render',{type:'cylinder',material:markerMat}); m.setLocalScale(.45,.02,.45);
-  m.setPosition(c.pos[0],.02,c.pos[2]); app.root.addChild(m); spots.push({c,m});
+  const mat=ringMat(RING_IDLE); const m=new pc.Entity();
+  const ring=pc.Mesh.fromGeometry(app.graphicsDevice,new pc.TorusGeometry({tubeRadius:.012,ringRadius:.16,segments:40,sides:6}));  // 32 cm ring, 2.4 cm tube
+  m.addComponent('render',{meshInstances:[new pc.MeshInstance(ring,mat)]}); m.setLocalScale(1,.25,1);
+  m.setPosition(c.pos[0],.015,c.pos[2]); app.root.addChild(m); spots.push({c,m,mat});
   const b=document.createElement('button'); b.textContent=c.name; b.onclick=()=>go(c); document.getElementById('rooms').appendChild(b);
 });
 function go(c){ rig.setPosition(c.pos[0],0,c.pos[2]); yaw=c.yaw; pitch=0; }
@@ -83,6 +100,13 @@ function moveBy(dx,dz){ const p=rig.getPosition(); let x=p.x,z=p.z;
 let mouseDown=false;
 canvas.addEventListener('mousedown',ev=>{ if(!pickSpot(ev.clientX,ev.clientY) && !pc.Mouse.isPointerLocked()) app.mouse.enablePointerLock(); });
 app.mouse.on(pc.EVENT_MOUSEMOVE,e=>{ if(pc.Mouse.isPointerLocked()){ yaw-=e.dx*.15; pitch=Math.max(-85,Math.min(85,pitch-e.dy*.15)); }});
+function nearestSpot(sx,sy){ const r=canvas.getBoundingClientRect(); let best=null,bd=40;
+  for(const s of spots){ const w=s.m.getPosition(); const v=cam.camera.worldToScreen(w); const d=w.clone().sub(cam.getPosition());
+    if(d.dot(cam.forward)<=0) continue; const dist=Math.hypot(v.x-(sx-r.left),v.y-(sy-r.top)); if(dist<bd){bd=dist;best=s;} } return best; }
+let hoverSpot=null;
+function setHover(s){ if(s===hoverSpot) return; if(hoverSpot){hoverSpot.mat.opacity=RING_IDLE;hoverSpot.mat.update();}
+  hoverSpot=s; if(s){s.mat.opacity=RING_HOVER;s.mat.update();} canvas.style.cursor=s?'pointer':''; }
+canvas.addEventListener('mousemove',ev=>{ if(pc.Mouse.isPointerLocked()){ const r=canvas.getBoundingClientRect(); setHover(nearestSpot(r.left+r.width/2,r.top+r.height/2)); } else setHover(nearestSpot(ev.clientX,ev.clientY)); });
 function pickSpot(sx,sy){ const r=canvas.getBoundingClientRect(); let best=null,bd=40;
   for(const s of spots){ const w=s.m.getPosition(); const v=cam.camera.worldToScreen(w); const fwd=cam.forward, d=w.clone().sub(cam.getPosition());
     if(d.dot(fwd)<=0) continue; const dist=Math.hypot(v.x-(sx-r.left),v.y-(sy-r.top)); if(dist<bd){bd=dist;best=s;} }
